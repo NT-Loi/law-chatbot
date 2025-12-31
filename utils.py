@@ -20,7 +20,12 @@ def table_to_md(table) -> str:
     rows = []
     for row in table.find_all("tr"):
         cells = [cell.get_text(strip=True) for cell in row.find_all(["th", "td"])]
-        rows.append(cells)
+        if cells: # Avoid empty rows
+            rows.append(cells)
+            
+    if not rows:
+        return ""
+        
     header = rows[0]
     body = rows[1:]
     md = "| " + " | ".join(header) + " |\n"
