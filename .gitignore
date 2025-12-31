@@ -3,4 +3,4 @@ __pycache__
 *.html
 BoPhapDienDienTu
 *.log
-.venv
+# .venv
