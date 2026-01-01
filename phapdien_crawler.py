@@ -109,7 +109,7 @@ for file in tqdm(demuc_files, desc="Processing files"):
     demuc_nodes = [node for node in tree_nodes if node["DeMucID"] == demuc_id]
 
     if len(demuc_nodes) == 0:
-        logging.warning("Không tìm thấy node cho đề mục: " + demuc_dir + file)
+        logging.warning("Không tìm thấy node cho đề mục: " + demuc_dir + '/' + file)
         continue
 
     chude_id = demuc_nodes[0].get('ChuDeID')

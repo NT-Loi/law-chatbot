@@ -19,7 +19,7 @@ class VBPLCrawler:
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-        self.base_url = "https://vbpl.vn"
+        self.base_url = "https://vbpl.vn" 
         self.output_dir = output_dir
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -74,9 +74,21 @@ class VBPLCrawler:
                     "title": link.get('title', '')
                 })
 
-        if not toc_items:
-            # Fallback for old style TOC or empty TOC
-            logging.warning(f"Warning: No TOC items found for {url}")
+        # Determine mode: Anchor-based (if TOC exists) or Dynamic (if TOC is empty)
+        is_dynamic_mode = (len(toc_items) == 0)
+        
+        if is_dynamic_mode:
+            logging.warning(f"Warning: No TOC items found for {url}. Switching to dynamic structure detection.")
+            # Initialize with a preamble section
+            toc_items.append({
+                "anchor": "preamble", 
+                "label": "Lời nói đầu", 
+                "type": "fallback", 
+                "title": ""
+            })
+            anchor_to_index = {} # Not used in dynamic mode
+        else:
+            anchor_to_index = {item['anchor']: i for i, item in enumerate(toc_items)}
 
         # 4. Extract content from main page
         content_div = main_soup.select_one('#toanvancontent')
@@ -86,37 +98,90 @@ class VBPLCrawler:
         if not content_div:
             return {"error": "Main content div not found"}
 
-        # Structuring strategy: Linear scan of descendants
-        # Map anchor names to TOC indices
-        anchor_to_index = {item['anchor']: i for i, item in enumerate(toc_items)}
-        
         # Initialize content buffers
         section_buffers = [""] * len(toc_items)
-        current_section_index = -1 # Before first anchor
+        current_section_index = 0 if is_dynamic_mode else -1
         
-        # We also need to see if exact IDs are used
-        # We'll use a set of names/ids to trigger section changes
-        
+        def get_next_significant_sibling(node):
+            n = node.next_sibling
+            while n:
+                if isinstance(n, str):
+                    if n.strip(): return n
+                elif n.name:
+                    return n
+                n = n.next_sibling
+            return None
+
+        # Clean unwanted tags
+        for tag in content_div(['script', 'style', 'noscript']):
+            tag.decompose()
+
+        # Regex for dynamic header detection
+        # Matches start of string: "Điều 1.", "Chương I"
+        header_pattern = re.compile(r'^(Điều|Chương|Mục|Phần)\s+([0-9IVX]+)', re.IGNORECASE)
+
         for element in content_div.descendants:
-            if element.name == 'a':
-                # Check if this is a marker
-                name = element.get('name')
-                if name and name in anchor_to_index:
-                    current_section_index = anchor_to_index[name]
-                    continue
+            
+            is_text = isinstance(element, str)
+            text_content = element.strip() if is_text else ""
+            
+            # --- Dynamic Mode Logic ---
+            if is_dynamic_mode and is_text and text_content:
+                # Check if this text node looks like a header
+                match = header_pattern.match(text_content)
+                if match:
+                    # Found a new section!
+                    label = match.group(0) # e.g., "Điều 1"
+                    # Try to capture a slightly better label if possible (e.g., "Điều 1. ")
+                    # But keeping it simple is safer.
+                    
+                    full_title = text_content.split('\n')[0].strip()
+                    
+                    # Create new section entry
+                    new_index = len(toc_items)
+                    toc_items.append({
+                        "anchor": f"auto_{new_index}",
+                        "label": label,
+                        "type": "auto_detected",
+                        "title": full_title
+                    })
+                    section_buffers.append("") # Add new buffer
+                    current_section_index = new_index
+            
+            # --- Anchor-based Mode Logic (Only if NOT dynamic) ---
+            if not is_dynamic_mode:
+                # Lookahead Logic to fix trailing labels
+                elem_text = ""
+                if not is_text and element.name:
+                     try:
+                        elem_text = element.get_text(strip=True)
+                     except:
+                        elem_text = ""
+                else:
+                    elem_text = text_content
                 
-                # Check ID just in case
-                eid = element.get('id')
-                if eid and eid in anchor_to_index:
-                    current_section_index = anchor_to_index[eid]
-                    continue
+                if len(elem_text) > 0 and len(elem_text) < 100:
+                     nxt = get_next_significant_sibling(element)
+                     if nxt and nxt.name == 'a':
+                         target = nxt.get('name') or nxt.get('id')
+                         if target and target in anchor_to_index:
+                             current_section_index = anchor_to_index[target]
+
+                # Standard Anchor Logic
+                if element.name == 'a':
+                    name = element.get('name')
+                    if name and name in anchor_to_index:
+                        current_section_index = anchor_to_index[name]
+                    
+                    eid = element.get('id')
+                    if eid and eid in anchor_to_index:
+                        current_section_index = anchor_to_index[eid]
+    
+                if element.name and element.get('id') in anchor_to_index:
+                    current_section_index = anchor_to_index[element.get('id')]
             
-            # Check for IDs on other elements
-            if element.name and element.get('id') in anchor_to_index:
-                current_section_index = anchor_to_index[element.get('id')]
-            
-            # If it's a text node, add to current section
-            if isinstance(element, str) and current_section_index >= 0:
+            # --- Content Extraction Logic ---
+            if is_text and current_section_index >= 0:
                 text = element.strip()
                 if text:
                     section_buffers[current_section_index] += text + " "
@@ -178,6 +243,15 @@ class VBPLCrawler:
         logging.info(f"Found {len(urls)} unique VBPL URLs to crawl.")
         
         for url in tqdm(urls, desc="Crawling documents"):
+            # Checkpoint: Check if file already exists
+            item_id = self.extract_item_id(url)
+            if item_id:
+                filename = f"{item_id}.json"
+                filepath = os.path.join(self.output_dir, filename)
+                if os.path.exists(filepath):
+                    logging.info(f"Skipping {url} (already exists)")
+                    continue
+
             data = self.get_document_data(url)
             self.save_doc(data)
 
@@ -185,9 +259,9 @@ if __name__ == "__main__":
     crawler = VBPLCrawler()
     
     # Example usage for testing
-    sample_url = "https://vbpl.vn/TW/Pages/vbpq-toanvan.aspx?ItemID=27615"
-    data = crawler.get_document_data(sample_url)
-    crawler.save_doc(data)
+    # sample_url = "https://vbpl.vn/TW/Pages/vbpq-toanvan.aspx?ItemID=181859"
+    # data = crawler.get_document_data(sample_url)
+    # crawler.save_doc(data)
     
     # Process the samples if they exist
     crawler.process_files("phap_dien/Dieu.json", "phap_dien/LienQuan.json")
