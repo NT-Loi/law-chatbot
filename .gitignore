@@ -33,12 +33,8 @@ backend/.env
 logs/
 
 # Data / Generated Files
-BoPhapDienDienTu/
 BoPhapDienDienTu.zip
-crawled_docs/
-phap_dien/
-chroma_db/
-qdrant_storage/
+data/
 
 # IDEs / Editors
 .idea/
