@@ -35,6 +35,7 @@ logs/
 # Data / Generated Files
 BoPhapDienDienTu.zip
 data/
+qdrant_data/
 
 # IDEs / Editors
 .idea/

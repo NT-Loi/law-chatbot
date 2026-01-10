@@ -1,0 +1,19 @@
+# FastAPI and server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# LangChain ecosystem
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-huggingface>=0.1.0
+langchain-google-genai>=2.0.0
+
+# Vector store and embeddings
+qdrant-client>=1.7.0
+fastembed>=0.3.0
+sentence-transformers>=2.2.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+torch>=2.0.0
