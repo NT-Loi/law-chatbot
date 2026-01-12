@@ -37,6 +37,11 @@ BoPhapDienDienTu.zip
 data/
 qdrant_data/
 
+phap_dien/
+vbqppl/
+du_lieu_luat_dataset.json
+BoPhapDienDienTu/
+*.csv  
 # IDEs / Editors
 .idea/
 .vscode/
