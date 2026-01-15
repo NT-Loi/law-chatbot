@@ -1,133 +1,138 @@
 import json
+import asyncio
 import os
-import sys
 import logging
-import time
-from tqdm import tqdm
-import torch
+import argparse
+from tqdm.asyncio import tqdm
+from dotenv import load_dotenv
 
-# Add current directory to path so we can import rag
+# Ensure we are running from the correct directory or path is set up
+import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from rag import RAG
+from chat import LegalRAGChain
 
-# Configure logging
-# Suppress info logs from imported libraries
-logging.getLogger().setLevel(logging.WARNING)
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("evaluation.log"),
+        logging.StreamHandler()
+    ]
+)
 
-# Create a custom logger for this script
-logger = logging.getLogger("evaluator")
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-logger.addHandler(handler)
+# Load environment variables
+load_dotenv()
 
-def normalize_text(text):
-    """Normalize text for matching."""
-    if not text:
-        return ""
-    return text.lower().strip().replace('\n', ' ').replace('  ', ' ')
-
-def evaluate_retrieval(dataset_path, k_values=[1, 3, 5, 10]):
-    """Evaluate RAG retrieval performance."""
-    
-    # Load dataset
-    logger.info(f"Loading dataset from {dataset_path}")
-    if not os.path.exists(dataset_path):
-        logger.error(f"Dataset file not found: {dataset_path}")
+async def evaluate(input_file, output_file, limit=None):
+    if not os.path.exists(input_file):
+        logging.error(f"Input file not found: {input_file}")
         return
 
-    with open(dataset_path, 'r', encoding='utf-8') as f:
+    logging.info(f"Loading dataset from {input_file}...")
+    with open(input_file, 'r', encoding='utf-8') as f:
         dataset = json.load(f)
     
-    # Initialize RAG
+    if limit:
+        dataset = dataset[:limit]
+        logging.info(f"Limiting evaluation to first {limit} items.")
+
+    logging.info("Initializing RAG engine...")
     try:
-        logger.info("Initializing RAG engine (this may take a moment)...")
-        rag = RAG()
+        rag_engine = RAG()
     except Exception as e:
-        logger.error(f"Failed to initialize RAG: {e}")
+        logging.error(f"Failed to initialize RAG engine: {e}")
         return
 
-    # Metrics storage
-    metrics = {k: {'precision': [], 'recall': []} for k in k_values}
-    
-    max_k = max(k_values)
-    
-    logger.info(f"Evaluating on {len(dataset)} samples...")
-    
-    # Use tqdm for progress bar
-    for item in tqdm(dataset, desc="Evaluating"):
-        query = item.get('question')
-        ground_truth_refs = item.get('reference', [])
-        
-        if not query or not ground_truth_refs:
-            continue
-            
-        # Normalize refs
-        norm_refs = [normalize_text(ref) for ref in ground_truth_refs]
-        
-        # Retrieve docs
-        try:
-            # We retrieve max_k docs to calculate all metrics
-            retrieved_docs = rag.retrieve(query, top_k=max_k)
-        except Exception as e:
-            logger.error(f"Error retrieving for query '{query}': {e}")
-            retrieved_docs = []
-            
-        # Calculate metrics for each k
-        for k in k_values:
-            top_k_docs = retrieved_docs[:k]
-            
-            # 1. Citation Precision@K: Fraction of docs that contain at least one GT ref
-            relevant_docs_count = 0
-            found_refs = set()
-            
-            for doc in top_k_docs:
-                content = normalize_text(doc.get('content', ''))
-                is_relevant = False
-                for ref in norm_refs:
-                    if ref in content:
-                        is_relevant = True
-                        found_refs.add(ref)
-                
-                if is_relevant:
-                    relevant_docs_count += 1
-            
-            precision = relevant_docs_count / k if k > 0 else 0
-            
-            # 2. Citation Recall@K: Fraction of GT refs found in ANY of the top K docs
-            recall = len(found_refs) / len(norm_refs) if norm_refs else 0
-            
-            metrics[k]['precision'].append(precision)
-            metrics[k]['recall'].append(recall)
+    logging.info("Initializing LegalRAGChain...")
+    try:
+        chain = LegalRAGChain()
+    except Exception as e:
+        logging.error(f"Failed to initialize LegalRAGChain: {e}")
+        rag_engine.close()
+        return
 
-    # Compute averages
-    print("\n" + "="*40)
-    print(" EVALUATION RESULTS ")
-    print("="*40)
+    results = []
     
-    for k in sorted(k_values):
-        precisions = metrics[k]['precision']
-        recalls = metrics[k]['recall']
+    logging.info(f"Starting evaluation on {len(dataset)} items...")
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
+    for i, item in enumerate(tqdm(dataset, desc="Evaluating")):
+        question = item.get("question")
+        reference_answer = item.get("answer")
+        reference_refs = item.get("reference", [])
         
-        avg_precision = sum(precisions) / len(precisions) if precisions else 0
-        avg_recall = sum(recalls) / len(recalls) if recalls else 0
+        system_response = ""
+        retrieved_docs = []
         
-        print(f"K={k:<2} | Precision: {avg_precision:.4f} | Recall: {avg_recall:.4f}")
+        try:
+            # Call the chat chain
+            # history is empty list
+            # Note: LegalRAGChain.chat yields strings representing JSON objects
+            async for chunk_str in chain.chat(question, [], rag_engine):
+                try:
+                    chunk = json.loads(chunk_str)
+                    type_ = chunk.get("type")
+                    
+                    if type_ == "content":
+                        delta = chunk.get("delta", "")
+                        system_response += delta
+                    elif type_ == "sources":
+                        data = chunk.get("data", [])
+                        # Extract id and hierarchy_path for storage
+                        for doc in data:
+                            retrieved_docs.append({
+                                "id": doc.get("id"),
+                                "hierarchy_path": doc.get("hierarchy_path") or doc.get("title", ""),
+                                "score": doc.get("score"),
+                                "rerank_score": doc.get("rerank_score")
+                            })
+                    elif type_ == "error":
+                         logging.warning(f"Error from chain for q='{question}': {chunk.get('content')}")
+                         system_response += f"\n[ERROR: {chunk.get('content')}]"
+                except json.JSONDecodeError:
+                    logging.warning(f"Failed to decode chunk: {chunk_str}")
+
+        except Exception as e:
+            logging.error(f"Exception processing question {i}: {question}. Error: {e}")
+            system_response = f"[EXCEPTION: {str(e)}]"
+        
+        results.append({
+            "id": i,
+            "question": question,
+            "reference_answer": reference_answer,
+            "reference_refs": reference_refs,
+            "system_response": system_response,
+            "retrieved_docs": retrieved_docs
+        })
+        
+        # Save periodically to avoid losing all data if crash
+        if (i + 1) % 10 == 0:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(results, f, ensure_ascii=False, indent=4)
+
+    # Final save
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=4)
+        
+    logging.info(f"Evaluation complete. Results saved to {output_file}")
     
-    print("="*40)
-    
-    # Close RAG resources if needed
-    if hasattr(rag, 'close'):
-        rag.close()
+    # Close RAG connection
+    try:
+        rag_engine.close()
+    except:
+        pass
 
 if __name__ == "__main__":
-    # Path to dataset
-    dataset_file = "/home/nt-loi/law-chatbot/du_lieu_luat_dataset.json"
+    parser = argparse.ArgumentParser(description="Evaluate Legal Chatbot System")
+    parser.add_argument("--input", default="../data/du_lieu_luat_dataset.json", help="Path to input dataset JSON")
+    parser.add_argument("--output", default="../data/evaluation_results.json", help="Path to output results JSON")
+    parser.add_argument("--limit", type=int, help="Limit number of questions to evaluate (for testing)", default=None)
     
-    # Check if dataset exists
-    if not os.path.exists(dataset_file):
-        print(f"Error: Dataset file not found at {dataset_file}")
-        sys.exit(1)
-        
-    evaluate_retrieval(dataset_file)
+    args = parser.parse_args()
+    
+    asyncio.run(evaluate(args.input, args.output, args.limit))
