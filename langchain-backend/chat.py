@@ -19,7 +19,8 @@ from prompts import (
     CHIT_CHAT_SYSTEM_PROMPT,
     EXPANSION_SYSTEM_PROMPT, EXPANSION_USER_PROMPT,
     HYBRID_SYSTEM_PROMPT, HYBRID_USER_PROMPT,
-    WEB_SEARCH_SYSTEM_PROMPT, WEB_SEARCH_USER_PROMPT
+    WEB_SEARCH_SYSTEM_PROMPT, WEB_SEARCH_USER_PROMPT,
+    REFLECTION_SYSTEM_PROMPT, REFLECTION_USER_PROMPT,
 )
 
 load_dotenv()
@@ -122,11 +123,8 @@ class ChatRouter:
         
         # 4. Invoke LLM
         res = await self.llm.ainvoke(messages)
-
-        # --- FIX Ở ĐÂY ---
         raw_content = res.content
         intent = clean_reasoning_output(raw_content) 
-        # -----------------
         
         # Debug log để kiểm tra model trả về gì
         logging.info(f"Router Input: {query} | Raw Output: {intent}")
@@ -291,46 +289,82 @@ class LegalRAGChain:
             max_tokens=8192,
             streaming=True
         )
-        # Model nhanh cho expansion (như đã thêm ở bước trước)
+        # Model nhanh cho Reflection
         self.llm_fast = ChatOpenAI(
             base_url=BASE_URL, api_key=API_KEY, model=CHAT_MODEL, 
-            temperature=0.0, max_tokens=1024
+            temperature=0.0, max_tokens=1024 # Tăng token một chút cho suy luận
         )
 
     async def chat(self, message, history, rag_engine):
-        # --- BƯỚC 0: QUERY EXPANSION (Giữ nguyên) ---
-        try:
-            expansion_res = await self.llm_fast.ainvoke([
-                SystemMessage(content=EXPANSION_SYSTEM_PROMPT),
-                HumanMessage(content=EXPANSION_USER_PROMPT.format(question=message))
-            ])
-            # --- FIX Ở ĐÂY ---
-            raw_content = expansion_res.content
-            keywords = clean_reasoning_output(raw_content) 
-            # -----------------
-
-            logging.info(f"Query: {message} | Expanded Keywords: {keywords}")
-            
-            # Nếu model trả về rỗng sau khi clean (trường hợp lỗi), dùng query gốc
-            if not keywords:
-                keywords = message
-
-            expanded_query = f"{message}\nCác thuật ngữ liên quan: {keywords}"
-        except Exception:
-            expanded_query = message
-
-        # --- BƯỚC 1: RETRIEVAL ---
-        # Lấy top_k lớn
-        raw_docs = rag_engine.retrieve(expanded_query, top_k=50)
+        # --- BƯỚC 0: MULTI-QUERY REFLECTION ---
+        queries = [message] # Mặc định ít nhất có câu gốc
         
-        if not raw_docs:
+        try:
+            reflection_res = await self.llm_fast.ainvoke([
+                SystemMessage(content=REFLECTION_SYSTEM_PROMPT),
+                HumanMessage(content=REFLECTION_USER_PROMPT.format(question=message))
+            ])
+            
+            # Clean và Parse JSON
+            raw_content = clean_reasoning_output(reflection_res.content)
+            # Tìm mảng JSON trong text (phòng trường hợp model nói nhảm thêm bên ngoài)
+            match = re.search(r'\[.*?\]', raw_content, re.DOTALL)
+            if match:
+                queries = json.loads(match.group(0))
+                logging.info(f"Generated Queries: {queries}")
+            else:
+                logging.warning("Reflection did not return JSON list, using raw output as single query.")
+                queries = [raw_content.strip()]
+
+        except Exception as e:
+            logging.error(f"Reflection failed: {e}")
+            queries = [message]
+
+         # --- BƯỚC 1: PARALLEL SEARCH (CHỈ SEARCH THÔ) ---
+        logging.info(f"Searching Qdrant for {len(queries)} queries parallelly...")
+        
+        # Mỗi query lấy top 20 thô (chưa rerank)
+        tasks = [
+            asyncio.to_thread(rag_engine.retrieve, q, top_k=20) 
+            for q in queries
+        ]
+        
+        # Chạy song song
+        raw_results_list = await asyncio.gather(*tasks)
+        
+        # --- BƯỚC 2: DEDUPLICATION & MERGE ---
+        unique_docs_map = {}
+        
+        for batch in raw_results_list:
+            for doc in batch:
+                point_id = doc['id']
+                # Nếu doc đã tồn tại, ta có thể giữ lại hoặc cập nhật
+                # Ở bước search thô, điểm qdrant_score không so sánh ngang hàng giữa các query khác nhau được
+                # nên ta cứ lấy lần xuất hiện đầu tiên hoặc ghi đè đều ổn.
+                if point_id not in unique_docs_map:
+                    unique_docs_map[point_id] = doc
+        
+        # Danh sách ứng viên duy nhất để chuẩn bị Rerank
+        merged_candidates = list(unique_docs_map.values())
+        logging.info(f"Total unique candidates after merge: {len(merged_candidates)}")
+
+        if not merged_candidates:
              yield json.dumps({"type": "error", "content": "Không tìm thấy văn bản liên quan."}, ensure_ascii=False) + "\n"
              return
 
-        # --- BƯỚC 2: KIỂM TRA ĐỘ TIN CẬY (LOGIC MỚI) ---
+        # --- BƯỚC 3: SINGLE RERANK (Rerank 1 lần duy nhất) ---
+        # QUAN TRỌNG: Rerank dựa trên câu hỏi gốc (message)
         
+        ranked_docs = await asyncio.to_thread(
+            rag_engine.rerank, 
+            query=message,  # <--- Dùng message gốc
+            sources=merged_candidates, 
+            top_k=10 # Lấy top 10 cuối cùng
+        )
+
+        # --- BƯỚC 2: KIỂM TRA ĐỘ TIN CẬY (LOGIC MỚI) ---
         # Kiểm tra điểm của văn bản đầu tiên (văn bản khớp nhất)
-        top_score = raw_docs[0].get("rerank_score", 0)
+        top_score = ranked_docs[0].get("rerank_score", 0)
         filtered_docs = []
         skip_llm_filter = False
         top_k = 5
@@ -339,7 +373,7 @@ class LegalRAGChain:
             
             # Logic: Lấy tất cả các docs có điểm > threshold
             # (Hoặc lấy top_k nếu tất cả đều cao để tránh quá tải context)
-            filtered_docs = [d for d in raw_docs if d.get("rerank_score", 0) > RERANK_THRESHOLD]
+            filtered_docs = [d for d in ranked_docs if d.get("rerank_score", 0) > RERANK_THRESHOLD]
             
             # Nếu list quá dài, cắt bớt về top_k để tập trung
             filtered_docs = filtered_docs[:top_k]
@@ -350,54 +384,51 @@ class LegalRAGChain:
             logging.info(f"Low Confidence ({top_score:.4f} <= {RERANK_THRESHOLD}). Using LLM Selection.")
             skip_llm_filter = False
 
-        # --- BƯỚC 3: XỬ LÝ LỌC (TÙY ĐIỀU KIỆN) ---
-        
+        # --- BƯỚC 3: XỬ LÝ LỌC (LLM SELECTION) ---
         if not skip_llm_filter:
-            # === CHẠY LLM FILTER (Logic cũ) ===
-            # Giới hạn số lượng docs đưa vào LLM để tránh lỗi max_tokens (Context overflow)
-            # Lấy top k docs có điểm rerank cao nhất để nhờ LLM lọc
-            docs_for_selection = raw_docs[:top_k]
-            
+            docs_for_selection = ranked_docs[:top_k]
             docs_text_block = format_law_docs_for_prompt(docs_for_selection)
+            
+            # LƯU Ý: Ở bước lọc này, vẫn nên cho LLM xem câu hỏi gốc (message) 
+            # để nó hiểu ngữ cảnh user muốn gì, thay vì câu query khô khan.
             select_messages = [
                 SystemMessage(content=SELECT_SYSTEM_PROMPT.format(docs_text=docs_text_block)),
-                HumanMessage(content=SELECT_USER_PROMPT.format(question=message))
+                HumanMessage(content=SELECT_USER_PROMPT.format(question=message)) 
             ]
             
             try:
                 selection_response = await self.select_llm.ainvoke(select_messages)
                 selected_ids = parse_selected_ids(selection_response.content)
                 if selected_ids:
-                    filtered_docs = [d for d in raw_docs if d['id'] in selected_ids]
+                    filtered_docs = [d for d in ranked_docs if d['id'] in selected_ids]
                 else:
-                    # Fallback: Nếu LLM lọc ra rỗng nhưng Rerank có kết quả, lấy tạm top k
-                    filtered_docs = raw_docs[:top_k]
+                    filtered_docs = ranked_docs[:top_k]
             except Exception as e:
                 logging.error(f"LLM Filter Error: {e}")
-                filtered_docs = raw_docs[:top_k] # Fallback an toàn
+                filtered_docs = ranked_docs[:top_k]
 
-        # Trả về Client danh sách nguồn đã chốt
+        # Trả về Client danh sách nguồn
         yield json.dumps({"type": "sources", "data": filtered_docs}, ensure_ascii=False) + "\n"
 
         if not filtered_docs:
             yield json.dumps({"type": "content", "delta": "Không tìm thấy quy định phù hợp."}, ensure_ascii=False) + "\n"
             return
 
-         # --- BƯỚC 4: ANSWERING VỚI CITATION EXTRACTION ---
+         # --- BƯỚC 4: ANSWERING ---
         final_context = format_law_docs_for_prompt(filtered_docs)
         
         chat_history_msgs = []
-        for h in history[-4:]: # Last 2 turns
+        for h in history[-4:]: 
             if h['role'] == 'user':
                 chat_history_msgs.append(HumanMessage(content=h['content']))
             else:
-                chat_history_msgs.append(SystemMessage(content=h['content'])) # or AIMessage
+                chat_history_msgs.append(SystemMessage(content=h['content'])) 
 
+        # Dùng câu hỏi gốc (message) để trả lời cho tự nhiên
         answer_messages = [
             SystemMessage(content=ANSWER_SYSTEM_PROMPT.format(context=final_context))
         ] + chat_history_msgs + [HumanMessage(content=ANSWER_USER_PROMPT.format(question=message))]
 
-        # Use shared streaming logic
         async for chunk in stream_with_citations(self.answer_llm, answer_messages, rag_engine=rag_engine):
             yield chunk
 

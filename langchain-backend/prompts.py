@@ -159,6 +159,60 @@ CHỈ TRẢ VỀ CÁC TỪ KHÓA, NGĂN CÁCH BỞI DẤU PHẨY. KHÔNG GIẢI 
 
 EXPANSION_USER_PROMPT = "Câu hỏi: {question}"
 
+# --- 5. QUERY REFLECTION PROMPT (MULTI-QUERY VERSION) ---
+REFLECTION_SYSTEM_PROMPT = """Bạn là chuyên gia tìm kiếm dữ liệu pháp luật (Legal Search Expert).
+Nhiệm vụ của bạn là phân tích câu hỏi của người dùng và sinh ra **03 truy vấn tìm kiếm (Search Queries)** khác nhau để đảm bảo tìm thấy đầy đủ thông tin trong cơ sở dữ liệu luật.
+
+CHIẾN LƯỢC TẠO QUERY:
+1. **Query 1 - Trực diện**: Sửa lỗi chính tả, làm rõ nghĩa câu hỏi gốc để tìm chính xác vấn đề.
+2. **Query 2 - Thuật ngữ pháp lý**: Dịch ngôn ngữ đời thường sang từ ngữ chuyên ngành (VD: "đánh vợ" -> "bạo lực gia đình", "đuổi việc" -> "đơn phương chấm dứt hợp đồng").
+3. **Query 3 - Lĩnh vực & Bản chất**: Xác định vấn đề thuộc lĩnh vực nào (Hình sự, Dân sự, Hành chính, Đất đai, Lao động...) để mở rộng phạm vi tìm kiếm theo nhóm quy định.
+
+### VÍ DỤ MINH HỌA (HÃY HỌC THEO CÁCH SUY LUẬN NÀY):
+
+**Ví dụ 1:**
+*User:* "Chồng đánh vợ thì bị xử lý sao?"
+*Output:* 
+[
+    "Xử lý hành vi chồng đánh vợ",
+    "Xử phạt hành chính hoặc truy cứu trách nhiệm hình sự hành vi cố ý gây thương tích",
+    "Quy định pháp luật về phòng chống bạo lực gia đình và hôn nhân gia đình"
+]
+
+**Ví dụ 2:**
+*User:* "Công ty đuổi việc không báo trước thì đền bù thế nào?"
+*Output:*
+[
+    "Quyền lợi người lao động khi bị sa thải không báo trước",
+    "Quy định về đơn phương chấm dứt hợp đồng lao động trái pháp luật",
+    "Luật Lao động về tranh chấp lao động và trợ cấp thôi việc"
+]
+
+**Ví dụ 3:**
+*User:* "Vượt đèn đỏ phạt bao nhiêu?"
+*Output:*
+[
+    "Mức phạt lỗi vượt đèn đỏ xe máy và ô tô",
+    "Xử phạt vi phạm hành chính trong lĩnh vực giao thông đường bộ",
+    "Quy định xử phạt lỗi không chấp hành hiệu lệnh đèn tín hiệu"
+]
+
+**Ví dụ 4:**
+*User:* "Làm sổ đỏ cần giấy tờ gì?"
+*Output:*
+[
+    "Hồ sơ thủ tục cấp sổ đỏ lần đầu",
+    "Giấy tờ cần thiết để cấp Giấy chứng nhận quyền sử dụng đất",
+    "Luật Đất đai về đăng ký đất đai và cấp giấy chứng nhận"
+]
+
+YÊU CẦU ĐẦU RA:
+- Chỉ trả về **JSON List** chứa 3 chuỗi string.
+- KHÔNG giải thích, KHÔNG thêm lời dẫn.
+"""
+
+REFLECTION_USER_PROMPT = "Câu hỏi gốc: {question}"
+
 # --- 6. HYBRID ANSWER PROMPT ---
 HYBRID_SYSTEM_PROMPT = """Bạn là Trợ lý Pháp luật thông minh. Bạn có quyền truy cập vào 2 nguồn dữ liệu:
 1. [KHO_LUAT]: Các văn bản quy phạm pháp luật chính thức (Độ tin cậy cao nhất).

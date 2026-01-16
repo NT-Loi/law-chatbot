@@ -1,113 +1,199 @@
-from sqlmodel import Field, SQLModel, Relationship, create_engine, UniqueConstraint
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-
+"""
+Ingest Pháp Điển and VBQPPL data into PostgreSQL
+This provides fast document retrieval for UI display (replacing slow Qdrant payload reads)
+"""
+import json
 import os
+import hashlib
+from tqdm import tqdm
+from sqlmodel import Session, select
+from sqlalchemy import text
 from dotenv import load_dotenv
-from typing import Optional, List
-from datetime import datetime
+
+from models import (
+    engine, init_db,
+    VBQPPLDoc, VBQPPLSection,
+    PhapDienDieu
+)
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
-
-engine = create_engine(DATABASE_URL, echo=DB_ECHO)
-async_engine = create_async_engine(ASYNC_DATABASE_URL, echo=DB_ECHO)
-async_session_factory = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
-
-class PDNode(SQLModel, table=True):
-    __tablename__ = "pd_nodes"
-    id: str = Field(primary_key=True)
-    content: str
-    title: str = Field(index=True)
-    demuc_id: Optional[str] = Field(default=None, index=True)
-    references: List["PDReference"] = Relationship(back_populates="pd_node")
+BATCH_SIZE = 100  # Smaller batch for stability
 
 
-class VBQPPLDoc(SQLModel, table=True):
-    __tablename__ = "vbqppl_docs"
-    id: str = Field(primary_key=True)
-    doc_number: Optional[str] = Field(default=None, index=True)
-    doc_date: Optional[datetime] = Field(default=None)
-    title: Optional[str] = Field(default=None, index=True)
-    url: str
-    is_crawled: bool = Field(default=False)
+def get_section_id(doc_id: str, hierarchy_path: str) -> str:
+    """
+    Generate unique section ID (MD5 Hash) based on document ID and section path.
+    This matches the ID format used in Qdrant for consistency.
+    """
+    safe_doc_id = str(doc_id) if doc_id else "unknown_doc"
+    safe_path = str(hierarchy_path) if hierarchy_path else "general"
+    raw_combination = f"{safe_doc_id}_{safe_path}"
+    return hashlib.md5(raw_combination.encode('utf-8')).hexdigest()
+
+
+def ingest_vbqppl(session: Session, data_path: str):
+    """Ingest VBQPPL documents and sections"""
+    print(f"\n📚 Loading VBQPPL data from: {data_path}")
     
-    nodes: List["VBQPPLNode"] = Relationship(back_populates="doc")
-
-
-class VBQPPLNode(SQLModel, table=True):
-    __tablename__ = "vbqppl_nodes"
-    id: Optional[int] = Field(default=None, primary_key=True) # MAPC
-    doc_id: str = Field(foreign_key="vbqppl_docs.id", index=True)
-    label: str = Field(index=True)
-    content: str
-    parent_id: Optional[int] = Field(default=None, foreign_key="vbqppl_nodes.id")
-    parents_label: Optional[str] = Field(default=None) 
-    doc: VBQPPLDoc = Relationship(back_populates="nodes")
-
-
-class PDReference(SQLModel, table=True):
-    __tablename__ = "pd_references"
-    id: Optional[int] = Field(default=None, primary_key=True)
-    phapdien_id: str = Field(foreign_key="phapdien_nodes.id", index=True)
-    vbqppl_doc_id: str = Field(foreign_key="vbqppl_docs.id")
-    vbqppl_label: str = Field(index=True)
-    details: str
-    phapdien_node: PhapDienNode = Relationship(back_populates="references")
-
-
-class PhapDienRelation(SQLModel, table=True):
-    __tablename__ = "phapdien_relations"
-    __table_args__ = (
-        UniqueConstraint("source_id", "target_id", name="unique_relation_pair"),
-    )
-    id: Optional[int] = Field(default=None, primary_key=True)
-    source_id: str = Field(foreign_key="phapdien_nodes.id", index=True)
-    target_id: str = Field(foreign_key="phapdien_nodes.id", index=True)
-
-
-class ChatSession(SQLModel, table=True):
-    __tablename__ = "chat_sessions"
-    id: str = Field(primary_key=True)
-    title: str = Field(index=True)
-    created_at: datetime = Field(default_factory=datetime.now)
+    with open(data_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
     
-    messages: List["ChatMessage"] = Relationship(back_populates="session", sa_relationship_kwargs={"cascade": "all, delete-orphan"})
-    user_docs: List["UserDocument"] = Relationship(back_populates="session", sa_relationship_kwargs={"cascade": "all, delete-orphan"})
-
-
-class ChatMessage(SQLModel, table=True):
-    __tablename__ = "chat_messages"
-    id: Optional[int] = Field(default=None, primary_key=True)
-    session_id: str = Field(foreign_key="chat_sessions.id", index=True)
-    role: str # 'user' or 'assistant'
-    content: str
-    sources: Optional[str] = Field(default=None) # JSON-stringified sources
-    created_at: datetime = Field(default_factory=datetime.now)
+    print(f"   Found {len(data)} documents")
     
-    session: ChatSession = Relationship(back_populates="messages")
-
-
-class UserDocument(SQLModel, table=True):
-    __tablename__ = "user_documents"
-    id: Optional[int] = Field(default=None, primary_key=True)
-    session_id: str = Field(foreign_key="chat_sessions.id", index=True)
-    filename: str
-    content: str
-    created_at: datetime = Field(default_factory=datetime.now)
+    doc_count = 0
+    section_count = 0
+    errors = 0
     
-    session: ChatSession = Relationship(back_populates="user_docs")
+    for item in tqdm(data, desc="Processing VBQPPL"):
+        doc_id = item.get("id")
+        if not doc_id:
+            continue
+        
+        try:
+            # Create document
+            doc = VBQPPLDoc(
+                id=doc_id,
+                title=item.get("title") if item.get("title") != "Unknown Title" else None,
+                url=item.get("url"),
+                content=item.get("content"),
+                status=item.get("status"),
+                error_message=item.get("error_message"),
+                original_name=item.get("original_name"),
+                original_link=item.get("original_link")
+            )
+            session.add(doc)
+            session.flush()  # Flush to get any constraint errors
+            doc_count += 1
+            
+            # Create sections
+            sections = item.get("sections") or []
+            for section in sections:
+                hierarchy_path = section.get("hierarchy_path", "")
+                
+                # Calculate Hash ID to match Qdrant ID
+                hash_id = get_section_id(doc_id, hierarchy_path)
+                
+                section_obj = VBQPPLSection(
+                    hash_id=hash_id,
+                    doc_id=doc_id,
+                    label=section.get("label", ""),
+                    content=section.get("content", ""),
+                    hierarchy_path=hierarchy_path,
+                    section_type=section.get("type")
+                )
+                session.add(section_obj)
+                section_count += 1
+            
+            # Commit every BATCH_SIZE documents
+            if doc_count % BATCH_SIZE == 0:
+                session.commit()
+                
+        except Exception as e:
+            session.rollback()
+            errors += 1
+            if errors <= 5:  # Only print first 5 errors
+                print(f"\n⚠️  Error ingesting {doc_id}: {str(e)[:100]}")
+            continue
+    
+    # Final commit
+    try:
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(f"\n⚠️  Error in final commit: {str(e)[:200]}")
+    
+    print(f"✅ Ingested {doc_count} VBQPPL documents with {section_count} sections ({errors} errors)")
 
 
-def init_db(drop_all: bool = False):
-    if drop_all:
-        print("Dropping all tables...")
-        SQLModel.metadata.drop_all(engine)
-    SQLModel.metadata.create_all(engine)
+def ingest_phapdien(session: Session, data_path: str):
+    """Ingest Pháp Điển data"""
+    print(f"\n📖 Loading Pháp Điển data from: {data_path}")
+    
+    with open(data_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    print(f"   Found {len(data)} điều")
+    
+    count = 0
+    errors = 0
+    
+    for item in tqdm(data, desc="Processing Pháp Điển"):
+        try:
+            dieu = PhapDienDieu(
+                id=item.get("ID"),
+                chi_muc=item.get("ChiMuc"),
+                mapc=item.get("MAPC"),
+                ten=item.get("TEN", ""),
+                noi_dung=item.get("NoiDung", ""),
+                chu_de_id=item.get("ChuDeID"),
+                de_muc_id=item.get("DeMucID"),
+                chuong_mapc=item.get("ChuongMAPC"),
+                stt=item.get("STT"),
+                vbqppl_refs=json.dumps(item.get("VBQPPL", []), ensure_ascii=False) if item.get("VBQPPL") else None
+            )
+            session.add(dieu)
+            count += 1
+            
+            if count % BATCH_SIZE == 0:
+                session.commit()
+                
+        except Exception as e:
+            session.rollback()
+            errors += 1
+            if errors <= 5:
+                print(f"\n⚠️  Error ingesting {item.get('ID')}: {str(e)[:100]}")
+            continue
+    
+    # Final commit
+    try:
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(f"\n⚠️  Error in final commit: {str(e)[:200]}")
+    
+    print(f"✅ Ingested {count} Pháp Điển điều ({errors} errors)")
 
 
-async def get_async_session():
-    async with async_session_factory() as session:
-        yield session
+def main():
+    import sys
+    
+    # Check for --drop flag
+    drop_all = "--drop" in sys.argv
+    
+    print("🚀 Starting PostgreSQL Ingestion")
+    print("=" * 50)
+    
+    # Initialize database
+    init_db(drop_all=drop_all)
+    
+    # Get data paths from environment
+    vbqppl_path = os.getenv("VBQPPL", "data/vbqppl_content.json")
+    phapdien_dir = os.getenv("PHAPDIEN_DIR", "data/phap_dien")
+    phapdien_path = os.path.join(phapdien_dir, "Dieu.json")
+    
+    # Make paths absolute if needed
+    if not os.path.isabs(vbqppl_path):
+        vbqppl_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), vbqppl_path)
+    if not os.path.isabs(phapdien_path):
+        phapdien_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), phapdien_path)
+    
+    with Session(engine) as session:
+        # Ingest VBQPPL
+        if os.path.exists(vbqppl_path):
+            ingest_vbqppl(session, vbqppl_path)
+        else:
+            print(f"⚠️  VBQPPL file not found: {vbqppl_path}")
+        
+        # Ingest Pháp Điển
+        if os.path.exists(phapdien_path):
+            ingest_phapdien(session, phapdien_path)
+        else:
+            print(f"⚠️  Pháp Điển file not found: {phapdien_path}")
+    
+    print("\n" + "=" * 50)
+    print("✅ PostgreSQL Ingestion Complete!")
+
+
+if __name__ == "__main__":
+    main()

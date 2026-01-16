@@ -1,8 +1,10 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 from contextlib import asynccontextmanager
+from sqlmodel import select
+from sqlalchemy.ext.asyncio import AsyncSession
 import logging
 from typing import List, Optional
 from pydantic import BaseModel
@@ -11,6 +13,7 @@ import json
 
 from chat import ChatRouter, LegalRAGChain, WebLawChain, ChitChatChain, HybridChain, ChatMode
 from rag import RAG
+from models import get_async_session, VBQPPLDoc, VBQPPLSection, PhapDienDieu
 
 logging.basicConfig(level=logging.INFO)
 
@@ -149,60 +152,146 @@ async def chat_endpoint(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/document/{doc_id}")
-async def get_document(doc_id: str):
+async def get_document(doc_id: str, session: AsyncSession = Depends(get_async_session)):
     """
     Retrieve document detail by ID for UI display.
+    Now uses PostgreSQL for fast retrieval instead of Qdrant payload scanning.
     """
-    if not rag_engine:
-        raise HTTPException(status_code=503, detail="RAG Engine not ready")
-
     try:
-        # Helper function for scrolling
-        def get_point_by_id(collection, doc_id):
-            res, _ = rag_engine.qdrant_client.scroll(
-                collection_name=collection,
-                scroll_filter=Filter(
-                    must=[FieldCondition(key="id", match=MatchValue(value=doc_id))]
-                ),
-                limit=1,
-                with_payload=True,
-                with_vectors=False
+        # Detect source based on ID pattern:
+        # - IDs with hyphen (-) are from phapdien (UUID format)
+        # - IDs without hyphen are from vbqppl (e.g. "15/2012/TT-BGTVT")
+        
+        if '-' in doc_id and len(doc_id) == 36:  # UUID pattern for Pháp Điển
+            # Query Pháp Điển
+            result = await session.execute(
+                select(PhapDienDieu).where(PhapDienDieu.id == doc_id)
             )
-            return res[0] if res else None
-
-        # Detect source collection based on ID pattern:
-        # - IDs with hyphen (-) are from phapdien
-        # - IDs without hyphen are from vbqppl
-        if '-' in doc_id:
-            # Try phapdien first, then vbqppl as fallback
-            point = get_point_by_id(rag_engine.pd_collection_name, doc_id)
-            if not point:
-                point = get_point_by_id(rag_engine.vb_collection_name, doc_id)
-        else:
-            # Try vbqppl first, then phapdien as fallback
-            point = get_point_by_id(rag_engine.vb_collection_name, doc_id)
-            if not point:
-                point = get_point_by_id(rag_engine.pd_collection_name, doc_id)
+            dieu = result.scalar_one_or_none()
+            
+            if dieu:
+                # Parse VBQPPL references if available
+                refs = []
+                if dieu.vbqppl_refs:
+                    try:
+                        refs = json.loads(dieu.vbqppl_refs)
+                    except:
+                        pass
+                
+                return {
+                    "metadata": {
+                        "id": doc_id,
+                        "title": dieu.ten,
+                        "url": "https://phapdien.moj.gov.vn/TraCuuPhapDien/MainBoPD.aspx",
+                        "source": "phapdien"
+                    },
+                    "content": [{
+                        "type": "text",
+                        "title": dieu.ten,
+                        "content": dieu.noi_dung
+                    }],
+                    "references": refs
+                }
         
-        if not point:
-             raise HTTPException(status_code=404, detail="Document not found")
+        # Determine if doc_id is a hash (32 hex chars)
+        if len(doc_id) == 32 and all(c in '0123456789abcdefABCDEF' for c in doc_id):
+            # Find section by hash_id
+            section_res = await session.execute(
+                select(VBQPPLSection).where(VBQPPLSection.hash_id == doc_id)
+            )
+            section = section_res.scalar_one_or_none()
+            
+            if section:
+                # Need to fetch parent doc to get title and URL metadata
+                doc_res = await session.execute(
+                    select(VBQPPLDoc).where(VBQPPLDoc.id == section.doc_id)
+                )
+                doc = doc_res.scalar_one_or_none()
+                doc_title = doc.title if doc else "Unknown Document"
+                doc_url = doc.url if doc else "#"
 
-        payload = point.payload
-        source = payload.get("source", "phapdien" if '-' in doc_id else "vbqppl")
+                return {
+                    "metadata": {
+                        "id": section.doc_id,
+                        "title": doc_title,
+                        "url": doc_url,
+                        "source": "vbqppl"
+                    },
+                    "content": [{
+                        "type": "text",
+                        "title": section.hierarchy_path or section.label,
+                        "content": section.content
+                    }]
+                }
+
+        # Query full VBQPPL document by doc_id
+        result = await session.execute(
+            select(VBQPPLDoc).where(VBQPPLDoc.id == doc_id)
+        )
+        doc = result.scalar_one_or_none()
         
-        return {
-            "metadata": {
-                "id": doc_id,
-                "title": payload.get("title", "Unknown"),
-                "url": payload.get("url", "#"),
-                "source": source
-            },
-            "content": [{
-                "type": "text",
-                "title": f"{payload.get('title', '')}\n{payload.get('hierarchy_path', '')}",
-                "content": payload.get("content", "")
-            }]
-        }
+        if doc:
+            # Get all sections for this document
+            sections_result = await session.execute(
+                select(VBQPPLSection).where(VBQPPLSection.doc_id == doc_id)
+            )
+            sections = sections_result.scalars().all()
+            
+            # Build content list from sections
+            content_list = []
+            for section in sections:
+                content_list.append({
+                    "type": "text",
+                    "title": section.hierarchy_path or section.label,
+                    "content": section.content
+                })
+            
+            # If no sections, use full document content
+            if not content_list and doc.content:
+                content_list = [{
+                    "type": "text",
+                    "title": doc.title or "Nội dung văn bản",
+                    "content": doc.content
+                }]
+            
+            return {
+                "metadata": {
+                    "id": doc_id, 
+                    "title": doc.title or "Unknown",
+                    "url": doc.url or "#",
+                    "source": "vbqppl"
+                },
+                "content": content_list,
+                "full_content": doc.content
+            }
+        
+        # Fallback: Try Qdrant/Pháp Điển if not found in VBQPPL (legacy support)
+        # ... existing fallback code ...
+        pass
+        
+        if not doc:
+             # Try Pháp Điển as last resort for non-UUID IDs
+             result = await session.execute(
+                select(PhapDienDieu).where(PhapDienDieu.id == doc_id)
+            )
+             dieu = result.scalar_one_or_none()
+             
+             if dieu:
+                 return {
+                    "metadata": {
+                        "id": doc_id,
+                        "title": dieu.ten,
+                        "url": "https://phapdien.moj.gov.vn/TraCuuPhapDien/MainBoPD.aspx",
+                        "source": "phapdien"
+                    },
+                    "content": [{
+                        "type": "text",
+                        "title": dieu.ten,
+                        "content": dieu.noi_dung
+                    }]
+                }
+        
+        raise HTTPException(status_code=404, detail="Document not found")
 
     except HTTPException:
         raise

@@ -3,7 +3,7 @@ import torch
 import logging
 from typing import Any, List
 from dotenv import load_dotenv
-
+import asyncio
 from qdrant_client import QdrantClient
 from qdrant_client.models import Prefetch, SparseVector, Fusion, FusionQuery, Filter, FieldCondition, MatchAny
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -81,7 +81,7 @@ class RAG:
                     Prefetch(query=sparse_vec, using="sparse", limit=top_k * 5)
                 ],
                 query=FusionQuery(fusion=Fusion.RRF),
-                limit=top_k * 2 # Get slightly more for reranking
+                limit=top_k
             ).points
         except Exception as e:
             logging.warning(f"Failed to query collection {collection_name}: {e}")
@@ -126,9 +126,9 @@ class RAG:
                 "source": payload.get("source", "")
             })
         
-        # return sources
+        return sources
         # 4. Rerank
-        return self.rerank(query, sources, top_k=top_k)
+        # return self.rerank(query, sources, top_k=top_k)
 
     def rerank(self, query: str, sources: list[dict[str, Any]], top_k: int = 5) -> list[dict[str, Any]]:
         if not sources:
