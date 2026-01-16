@@ -280,12 +280,12 @@ class LegalRAGChain:
             temperature=0.0,
             max_tokens=1024
         )
-        # Model cho Answering (Higher Temp)
+        # Model cho Answering (Slightly Higher Temp)
         self.answer_llm = ChatOpenAI(
             base_url=BASE_URL,
             api_key=API_KEY,
             model=CHAT_MODEL,
-            temperature=0.2,
+            temperature=0.3,
             max_tokens=8192,
             streaming=True
         )

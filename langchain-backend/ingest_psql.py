@@ -50,49 +50,54 @@ def ingest_vbqppl(session: Session, data_path: str):
         if not doc_id:
             continue
         
+        # Check if document already exists
+        if session.get(VBQPPLDoc, doc_id):
+            continue
+
         try:
-            # Create document
-            doc = VBQPPLDoc(
-                id=doc_id,
-                title=item.get("title") if item.get("title") != "Unknown Title" else None,
-                url=item.get("url"),
-                content=item.get("content"),
-                status=item.get("status"),
-                error_message=item.get("error_message"),
-                original_name=item.get("original_name"),
-                original_link=item.get("original_link")
-            )
-            session.add(doc)
-            session.flush()  # Flush to get any constraint errors
-            doc_count += 1
-            
-            # Create sections
-            sections = item.get("sections") or []
-            for section in sections:
-                hierarchy_path = section.get("hierarchy_path", "")
-                
-                # Calculate Hash ID to match Qdrant ID
-                hash_id = get_section_id(doc_id, hierarchy_path)
-                
-                section_obj = VBQPPLSection(
-                    hash_id=hash_id,
-                    doc_id=doc_id,
-                    label=section.get("label", ""),
-                    content=section.get("content", ""),
-                    hierarchy_path=hierarchy_path,
-                    section_type=section.get("type")
+            with session.begin_nested():
+                # Create document
+                doc = VBQPPLDoc(
+                    id=doc_id,
+                    title=item.get("title") if item.get("title") != "Unknown Title" else None,
+                    url=item.get("url"),
+                    content=item.get("content"),
+                    status=item.get("status"),
+                    error_message=item.get("error_message"),
+                    original_name=item.get("original_name"),
+                    original_link=item.get("original_link")
                 )
-                session.add(section_obj)
-                section_count += 1
+                session.add(doc)
+                
+                # Create sections
+                sections = item.get("sections") or []
+                for section in sections:
+                    hierarchy_path = section.get("hierarchy_path", "")
+                    
+                    # Calculate Hash ID to match Qdrant ID
+                    hash_id = get_section_id(doc_id, hierarchy_path)
+                    
+                    section_obj = VBQPPLSection(
+                        hash_id=hash_id,
+                        doc_id=doc_id,
+                        label=section.get("label", ""),
+                        content=section.get("content", ""),
+                        hierarchy_path=hierarchy_path,
+                        section_type=section.get("type")
+                    )
+                    session.add(section_obj)
+            
+            # If successful (no exception raised)
+            doc_count += 1
+            section_count += len(item.get("sections") or [])
             
             # Commit every BATCH_SIZE documents
             if doc_count % BATCH_SIZE == 0:
                 session.commit()
                 
         except Exception as e:
-            session.rollback()
             errors += 1
-            if errors <= 5:  # Only print first 5 errors
+            if errors <= 10:  # Print first 10 errors
                 print(f"\n⚠️  Error ingesting {doc_id}: {str(e)[:100]}")
             continue
     
@@ -168,13 +173,16 @@ def main():
     init_db(drop_all=drop_all)
     
     # Get data paths from environment
-    vbqppl_path = os.getenv("VBQPPL", "data/vbqppl_content.json")
-    phapdien_dir = os.getenv("PHAPDIEN_DIR", "data/phap_dien")
+    vbqppl_path = os.getenv("VBQPPL")
+    qa_vbqppl_path = os.getenv("QA_VBQPPL")
+    phapdien_dir = os.getenv("PHAPDIEN_DIR")
     phapdien_path = os.path.join(phapdien_dir, "Dieu.json")
     
     # Make paths absolute if needed
     if not os.path.isabs(vbqppl_path):
         vbqppl_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), vbqppl_path)
+    if not os.path.isabs(qa_vbqppl_path):
+        qa_vbqppl_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), qa_vbqppl_path)
     if not os.path.isabs(phapdien_path):
         phapdien_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), phapdien_path)
     
@@ -184,6 +192,12 @@ def main():
             ingest_vbqppl(session, vbqppl_path)
         else:
             print(f"⚠️  VBQPPL file not found: {vbqppl_path}")
+        
+        # Ingest QA VBQPPL
+        if os.path.exists(qa_vbqppl_path):
+            ingest_vbqppl(session, qa_vbqppl_path)
+        else:
+            print(f"⚠️  QA VBQPPL file not found: {qa_vbqppl_path}")
         
         # Ingest Pháp Điển
         if os.path.exists(phapdien_path):

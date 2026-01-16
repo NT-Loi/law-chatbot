@@ -36,7 +36,7 @@ class VBQPPLDoc(SQLModel, table=True):
     __tablename__ = "vbqppl_docs"
     
     id: str = Field(primary_key=True)  # e.g. "15/2012/TT-BGTVT"
-    title: Optional[str] = Field(default=None, index=True)
+    title: Optional[str] = Field(default=None, sa_column=Column(Text))  # Changed to Text, removed index=True
     url: Optional[str] = Field(default=None)
     content: Optional[str] = Field(default=None, sa_column=Column(Text))  # Full document content
     status: Optional[str] = Field(default=None)
@@ -58,7 +58,7 @@ class VBQPPLSection(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     hash_id: Optional[str] = Field(default=None, index=True)  # MD5 hash of doc_id + hierarchy_path (matches Qdrant ID)
     doc_id: str = Field(foreign_key="vbqppl_docs.id", index=True)
-    label: str = Field(index=True)  # e.g. "Điều 1. Phạm vi điều chỉnh"
+    label: str = Field(sa_column=Column(Text))  # Changed to Text, removed index=True
     content: str = Field(sa_column=Column(Text))
     hierarchy_path: Optional[str] = Field(default=None)
     section_type: Optional[str] = Field(default=None)  # "dieu", "chuong", etc.

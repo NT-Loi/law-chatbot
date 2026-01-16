@@ -67,7 +67,8 @@ async def evaluate(input_file, output_file, limit=None):
         reference_refs = item.get("reference", [])
         
         system_response = ""
-        retrieved_docs = []
+        used_docs = []
+        context_docs = []
         
         try:
             # Call the chat chain
@@ -83,14 +84,36 @@ async def evaluate(input_file, output_file, limit=None):
                         system_response += delta
                     elif type_ == "sources":
                         data = chunk.get("data", [])
-                        # Extract id and hierarchy_path for storage
+                        # This is the context after reranking
                         for doc in data:
-                            retrieved_docs.append({
+                            context_docs.append({
                                 "id": doc.get("id"),
+                                "doc_id": doc.get("doc_id"),
+                                "title": doc.get("title"),
                                 "hierarchy_path": doc.get("hierarchy_path") or doc.get("title", ""),
+                                "content": doc.get("content"),
                                 "score": doc.get("score"),
                                 "rerank_score": doc.get("rerank_score")
                             })
+                    elif type_ == "used_docs":
+                        # This is the documents actually cited by the model
+                        data = chunk.get("data", []) or chunk.get("ids", [])
+                        # Data might be list of dicts (rich) or list of strings (ids)
+                        if data and isinstance(data[0], dict):
+                             for doc in data:
+                                used_docs.append({
+                                    "id": doc.get("id"),
+                                    "doc_id": doc.get("doc_id"),
+                                    "title": doc.get("title"),
+                                    "hierarchy_path": doc.get("hierarchy_path") or doc.get("title", ""),
+                                    "content": doc.get("content"),
+                                    "score": doc.get("score"),
+                                    "rerank_score": doc.get("rerank_score")
+                                })
+                        else:
+                             # Just IDs
+                             used_docs = [{"id": uid} for uid in data]
+
                     elif type_ == "error":
                          logging.warning(f"Error from chain for q='{question}': {chunk.get('content')}")
                          system_response += f"\n[ERROR: {chunk.get('content')}]"
@@ -107,7 +130,8 @@ async def evaluate(input_file, output_file, limit=None):
             "reference_answer": reference_answer,
             "reference_refs": reference_refs,
             "system_response": system_response,
-            "retrieved_docs": retrieved_docs
+            "context_docs": context_docs,
+            "used_docs": used_docs
         })
         
         # Save periodically to avoid losing all data if crash

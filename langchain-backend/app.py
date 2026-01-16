@@ -11,6 +11,8 @@ from pydantic import BaseModel
 import re
 import json
 
+from prometheus_fastapi_instrumentator import Instrumentator
+
 from chat import ChatRouter, LegalRAGChain, WebLawChain, ChitChatChain, HybridChain, ChatMode
 from rag import RAG
 from models import get_async_session, VBQPPLDoc, VBQPPLSection, PhapDienDieu
@@ -61,6 +63,9 @@ app = FastAPI(
     title="Vietnamese Law RAG Chatbot",
     lifespan=lifespan
 )
+
+# Instrument Prometheus
+Instrumentator().instrument(app).expose(app)
 
 app.add_middleware(
     CORSMiddleware,
@@ -151,7 +156,56 @@ async def chat_endpoint(request: ChatRequest):
         logging.error(f"Error in chat endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/document/{doc_id}")
+@app.get("/documents")
+async def list_documents(
+    q: Optional[str] = None, 
+    limit: int = 50, 
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    Search/List documents from VBQPPL database.
+    Query 'q' matches against title or ID.
+    """
+    try:
+        query = select(VBQPPLDoc).limit(limit)
+        
+        if q:
+            # Case-insensitive search on title or ID
+            # Note: For efficient search we might need Full Text Search later, 
+            # but ILIKE is fine for now on small datasets.
+            from sqlalchemy import or_
+            query = query.where(
+                or_(
+                    VBQPPLDoc.title.ilike(f"%{q}%"),
+                    VBQPPLDoc.id.ilike(f"%{q}%")
+                )
+            )
+        
+        # Order by ID for stability (or date if available)
+        query = query.order_by(VBQPPLDoc.id.desc())
+        
+        result = await session.execute(query)
+        docs = result.scalars().all()
+        
+        # Map to lightweight metadata objects
+        return [
+            {
+                "id": doc.id,
+                "title": doc.title or "No Title",
+                "doc_number": doc.id, # Using ID as doc number
+                "url": doc.url,
+                "doc_date": None, # Date not currently in model schema
+                "source": "vbqppl"
+            }
+            for doc in docs
+        ]
+            
+    except Exception as e:
+        logging.error(f"List Documents Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@app.get("/document/{doc_id:path}")
 async def get_document(doc_id: str, session: AsyncSession = Depends(get_async_session)):
     """
     Retrieve document detail by ID for UI display.
