@@ -11,7 +11,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from rag import RAG
-from chat import LegalRAGChain
+from chat import LegalRAGChain, clean_reasoning_output
 
 # Setup logging
 logging.basicConfig(
@@ -55,7 +55,24 @@ async def evaluate(input_file, output_file, limit=None):
         return
 
     results = []
+    processed_questions = set()
     
+    if os.path.exists(output_file):
+        try:
+            with open(output_file, 'r', encoding='utf-8') as f:
+                existing_data = json.load(f)
+                if isinstance(existing_data, list):
+                    results = existing_data
+                elif isinstance(existing_data, dict) and "results" in existing_data:
+                    results = existing_data["results"]
+                
+                for r in results:
+                    processed_questions.add(r.get("question"))
+            
+            logging.info(f"Resuming from existing output. Found {len(processed_questions)} processed questions.")
+        except Exception as e:
+            logging.warning(f"Failed to load existing output for resume: {e}. Starting fresh.")
+
     logging.info(f"Starting evaluation on {len(dataset)} items...")
     
     # Create output directory if it doesn't exist
@@ -63,6 +80,10 @@ async def evaluate(input_file, output_file, limit=None):
 
     for i, item in enumerate(tqdm(dataset, desc="Evaluating")):
         question = item.get("question")
+        
+        if question in processed_questions:
+            continue
+            
         reference_answer = item.get("answer")
         reference_refs = item.get("reference", [])
         
@@ -90,8 +111,7 @@ async def evaluate(input_file, output_file, limit=None):
                                 "id": doc.get("id"),
                                 "doc_id": doc.get("doc_id"),
                                 "title": doc.get("title"),
-                                "hierarchy_path": doc.get("hierarchy_path") or doc.get("title", ""),
-                                "content": doc.get("content"),
+                                "hierarchy_path": doc.get("hierarchy_path"),
                                 "score": doc.get("score"),
                                 "rerank_score": doc.get("rerank_score")
                             })
@@ -105,8 +125,7 @@ async def evaluate(input_file, output_file, limit=None):
                                     "id": doc.get("id"),
                                     "doc_id": doc.get("doc_id"),
                                     "title": doc.get("title"),
-                                    "hierarchy_path": doc.get("hierarchy_path") or doc.get("title", ""),
-                                    "content": doc.get("content"),
+                                    "hierarchy_path": doc.get("hierarchy_path"),
                                     "score": doc.get("score"),
                                     "rerank_score": doc.get("rerank_score")
                                 })
@@ -124,6 +143,9 @@ async def evaluate(input_file, output_file, limit=None):
             logging.error(f"Exception processing question {i}: {question}. Error: {e}")
             system_response = f"[EXCEPTION: {str(e)}]"
         
+        # Remove reasoning process
+        system_response = clean_reasoning_output(system_response)
+
         results.append({
             "id": i,
             "question": question,

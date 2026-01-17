@@ -25,8 +25,7 @@ yarn-debug.log*
 yarn-error.log*
 
 # Environment Variables
-.env
-backend/.env
+*.env
 
 # Logs
 *.log
@@ -34,8 +33,12 @@ logs/
 
 # Data / Generated Files
 BoPhapDienDienTu.zip
-data/
+# data/
 qdrant_data/
+*.json
+*.html
+*.txt
+*.csv
 
 # IDEs / Editors
 .idea/

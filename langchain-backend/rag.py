@@ -10,24 +10,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from fastembed import SparseTextEmbedding
 import voyageai
 
-from utils import get_collection_name
-
-import hashlib
-
-def get_point_id(doc_id: str, hierarchy_path: str) -> str:
-    """
-    Tạo ID duy nhất (MD5 Hash) cho point dựa trên ID văn bản và vị trí điều khoản.
-    Output ví dụ: 'a1b2c3d4e5f6...' (32 ký tự, an toàn cho URL/Frontend key)
-    """
-    # Xử lý trường hợp null
-    safe_doc_id = str(doc_id) if doc_id else "unknown_doc"
-    safe_path = str(hierarchy_path) if hierarchy_path else "general"
-
-    # Tạo chuỗi kết hợp (Raw String)
-    raw_combination = f"{safe_doc_id}_{safe_path}"
-
-    # Hash MD5 để tạo chuỗi ID cố định, không trùng lặp và an toàn
-    return hashlib.md5(raw_combination.encode('utf-8')).hexdigest()
+from utils import get_collection_name, get_point_id
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -61,6 +44,7 @@ class RAG:
         # Collection Names
         self.pd_collection_name = get_collection_name("phapdien", embedding_name)
         self.vb_collection_name = get_collection_name("vbqppl", embedding_name)
+        self.alqac25_collection_name = "alqac25_collection"
 
         # Init Reranker
         self.rerank_model_name = os.getenv("RERANKING_MODEL", "rerank-2")
@@ -87,7 +71,7 @@ class RAG:
             logging.warning(f"Failed to query collection {collection_name}: {e}")
             return []
 
-    def retrieve(self, query: str, top_k: int = 5) -> List[dict[str, Any]]:
+    def retrieve(self, query: str, top_k: int = 5, collection_names: List[str] = None) -> List[dict[str, Any]]:
         # 1. Embed Query
         dense_vec = self.embedding.embed_query(query)
         sparse_gen = self.sparse_embedding.embed([query])
@@ -97,16 +81,21 @@ class RAG:
             values=sparse_emb.values.tolist(),
         )
 
-        # 2. Retrieve from both collections
-        # results_pd = self._query_collection(self.pd_collection_name, dense_vec, sparse_vec, top_k)
-        results_vb = self._query_collection(self.vb_collection_name, dense_vec, sparse_vec, top_k)
+        # 2. Retrieve from specified or default collections
+        if collection_names:
+            collections = collection_names if isinstance(collection_names, list) else [collection_names]
+        else:
+            collections = [self.vb_collection_name] # Default to vbqppl for now
+
+        results = []
+        for coll in collections:
+            results.extend(self._query_collection(coll, dense_vec, sparse_vec, top_k))
 
         # 3. Standardize results
         sources = []
         seen_point_ids = set()
 
-        # for point in results_pd + results_vb:
-        for point in results_vb:
+        for point in results:
             payload = point.payload
             
             id = payload.get("id", "")
@@ -118,6 +107,7 @@ class RAG:
             sources.append({
                 "id": id,
                 "doc_id": payload.get("doc_id", ""),
+                "article_id": payload.get("article_id", ""),
                 "title": payload.get("title", ""),
                 "hierarchy_path": payload.get("hierarchy_path", ""),
                 "url": payload.get("url", "#"),
@@ -162,15 +152,17 @@ class RAG:
             # Fallback: return top_k of original sources (assuming they were roughly ordered by retrieval)
             return sources[:top_k]
 
-    def get_documents_by_ids(self, ids: List[str]) -> List[dict]:
+    def get_documents_by_ids(self, ids: List[str], collection_names: List[str] = None) -> List[dict]:
         """
         Fetch full document content from Qdrant based on a list of IDs.
-        Separates IDs by collection based on the presence of a hyphen.
         """
-        pd_ids = [i for i in ids if "-" in i]
-        vb_ids = [i for i in ids if "-" not in i]
-        
         results = []
+        
+        # If collection_names is provided, use it. Otherwise, try to infer or check all.
+        if collection_names:
+            target_collections = collection_names if isinstance(collection_names, list) else [collection_names]
+        else:
+            target_collections = [self.pd_collection_name, self.vb_collection_name, self.alqac25_collection_name]
         
         def fetch(collection, id_list):
             if not id_list: return []
@@ -195,22 +187,30 @@ class RAG:
                 logging.error(f"Error fetching docs from {collection}: {e}")
                 return []
 
-        pd_points = fetch(self.pd_collection_name, pd_ids)
-        vb_points = fetch(self.vb_collection_name, vb_ids)
+        for coll in target_collections:
+            points = fetch(coll, ids)
+            for point in points:
+                payload = point.payload
+                results.append({
+                    "id": payload.get("id", ""),
+                    "doc_id": payload.get("doc_id", ""),
+                    "article_id": payload.get("article_id", ""),
+                    "title": payload.get("title", ""),
+                    "hierarchy_path": payload.get("hierarchy_path", ""),
+                    "url": payload.get("url", "#"),
+                    "content": payload.get("content", ""),
+                    "source": payload.get("source", "")
+                })
         
-        for point in pd_points + vb_points:
-             payload = point.payload
-             results.append({
-                "id": payload.get("id", ""),
-                "doc_id": payload.get("doc_id", ""),
-                "title": payload.get("title", ""),
-                "hierarchy_path": payload.get("hierarchy_path", ""),
-                "url": payload.get("url", "#"),
-                "content": payload.get("content", ""),
-                "source": payload.get("source", "")
-            })
-            
-        return results
+        # Simple deduplication by system-id just in case
+        unique_results = []
+        seen = set()
+        for r in results:
+            if r['id'] not in seen:
+                unique_results.append(r)
+                seen.add(r['id'])
+                
+        return unique_results
 
     def close(self):
         self.qdrant_client.close()

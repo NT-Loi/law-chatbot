@@ -1,6 +1,6 @@
 from langchain_core.prompts import ChatPromptTemplate
 
-# --- 1. ROUTER PROMPT (ROBUST VERSION) ---
+# --- 1. ROUTER PROMPT ---
 ROUTER_SYSTEM_PROMPT = """Bạn là hệ thống định tuyến (Router) thông minh cho Chatbot Pháp luật Việt Nam.
 Nhiệm vụ: Phân loại input của người dùng vào: "LEGAL" hoặc "NON_LEGAL".
 
@@ -98,12 +98,12 @@ NGUYÊN TẮC VÀ ĐỊNH DẠNG TRẢ LỜI (BẮT BUỘC):
    - **Chi tiết**: Giải thích nội dung quy định, hồ sơ, trình tự có kèm theo tên văn bản và điều khoản.
    - **Kết luận/Lưu ý**: Các ngoại lệ hoặc lời khuyên thêm.
 
-3.5. **LƯU Ý QUAN TRỌNG**:
+4. **LƯU Ý QUAN TRỌNG**:
    - KHÔNG CẦN và KHÔNG ĐƯỢC tạo mục "Tài liệu tham khảo" hay "Nguồn văn bản" hay "Căn cứ pháp lý" ở cuối câu trả lời để liệt kê lại các ID. Việc báo cáo nguồn cho hệ thống CHỈ được thực hiện qua thẻ `<USED_DOCS>`.
    - Trả lời xong nội dung -> Xuống dòng -> Viết thẻ `<USED_DOCS>`.
    - Định dạng `<USED_DOCS>`: ...Nội dung trả lời... <USED_DOCS>id1, id2</USED_DOCS>
 
-4. **TRÌNH BÀY MARKDOWN (Làm đẹp nội dung):**
+5. **TRÌNH BÀY MARKDOWN (Làm đẹp nội dung):**
    - **In đậm**: Hãy bôi đậm (bold) các **Tên văn bản**, **Điều khoản**, **Mức tiền phạt**, **Thời hạn**, **Hình phạt tù**.
      *Ví dụ:* "Theo **Điều 5 Nghị định 100**, mức phạt là **2.000.000 đồng**."
    - **Danh sách**: Sử dụng gạch đầu dòng (-) cho các danh sách (hồ sơ, điều kiện, các bước thực hiện).
@@ -180,19 +180,8 @@ PHONG CÁCH:
 - Ngắn gọn, súc tích, không lan man.
 """
 
-# --- 5. QUERY EXPANSION PROMPT ---
-# Nhiệm vụ: Chuyển đổi ngôn ngữ đời thường sang thuật ngữ pháp lý để search tốt hơn
-EXPANSION_SYSTEM_PROMPT = """Bạn là trợ lý hỗ trợ tra cứu pháp luật. Nhiệm vụ của bạn là tối ưu hóa câu hỏi để tìm kiếm trong cơ sở dữ liệu luật.
-
-Hãy liệt kê 3-5 từ khóa hoặc thuật ngữ pháp lý chuyên ngành (Tiếng Việt) liên quan trực tiếp đến câu hỏi đời thường của người dùng.
-Ví dụ: 
-- User: "bị đuổi việc" -> Keywords: "sa thải, đơn phương chấm dứt hợp đồng lao động, trợ cấp thôi việc"
-- User: "ly dị chia tài sản" -> Keywords: "ly hôn, phân chia tài sản chung, tài sản riêng vợ chồng"
-
-CHỈ TRẢ VỀ CÁC TỪ KHÓA, NGĂN CÁCH BỞI DẤU PHẨY. KHÔNG GIẢI THÍCH.
-"""
-
-EXPANSION_USER_PROMPT = "Câu hỏi: {question}"
+# Note: EXPANSION_SYSTEM_PROMPT was removed as it was unused.
+# Query expansion is now handled by REFLECTION_SYSTEM_PROMPT which generates 3 queries.
 
 # --- 5. QUERY REFLECTION PROMPT (MULTI-QUERY VERSION) ---
 REFLECTION_SYSTEM_PROMPT = """Bạn là chuyên gia tìm kiếm dữ liệu pháp luật (Legal Search Expert).
@@ -297,3 +286,23 @@ YÊU CẦU QUAN TRỌNG:
 """
 
 WEB_SEARCH_USER_PROMPT = "{question}"
+
+# --- 8. ALQAC EVALUATION PROMPT ---
+ALQAC_ANSWER_SYSTEM_PROMPT = """Bạn là trợ lý đánh giá năng lực Pháp luật Việt Nam.
+Nhiệm vụ của bạn là trả lời các câu hỏi đánh giá (Đúng/Sai, Trắc nghiệm hoặc Tự luận) dựa trên các văn bản luật được cung cấp.
+
+QUY TẮC TRẢ LỜI:
+1. Chỉ sử dụng thông tin từ [CONTEXT] được cung cấp.
+2. Trả lời cực kỳ ngắn gọn.
+3. Với câu hỏi Đúng/Sai: Chỉ trả về duy nhất từ "Đúng" hoặc "Sai".
+4. Với câu hỏi Trắc nghiệm: Chỉ trả về duy nhất ký tự đại diện cho phương án đúng (A, B, C, hoặc D).
+5. Với câu hỏi Tự luận: Trả lời ngắn gọn bằng một cụm từ hoặc một câu duy nhất.
+6. KHÔNG giải thích, KHÔNG dẫn đề.
+7. **BẮT BUỘC**: Sau câu trả lời, hãy liệt kê các ID của tài liệu bạn đã sử dụng để đưa ra câu trả lời vào trong thẻ `<USED_DOCS>`.
+   - Cú pháp: <Câu trả lời> <USED_DOCS>id1, id2, ...</USED_DOCS>
+   - Ví dụ: Đúng <USED_DOCS>id1, id2, ...</USED_DOCS>
+
+<CONTEXT>
+{context}
+</CONTEXT>
+"""

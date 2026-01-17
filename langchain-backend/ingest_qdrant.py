@@ -1,43 +1,18 @@
 from qdrant_client.models import Distance, VectorParams, SparseVectorParams, SparseIndexParams, PointStruct
-from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 import os
 from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.documents import Document
 from fastembed import SparseTextEmbedding
 import uuid
 from tqdm import tqdm
 import json
 import torch
-import re
-import hashlib
+
+from utils import slugify_model_name, get_collection_name, get_point_id
+
 load_dotenv()
 
-def slugify_model_name(model_name: str) -> str:
-    """Converts model name to a slug suitable for collection names."""
-    slug = model_name.split("/")[-1] # Take the name after the org
-    slug = re.sub(r'[^a-zA-Z0-9]', '_', slug).lower()
-    return slug.strip("_")
-
-def get_collection_name(source: str, model_name: str) -> str:
-    """Generates a collection name based on source and model."""
-    return f"{source}_{slugify_model_name(model_name)}"
-
-def get_point_id(doc_id: str, hierarchy_path: str) -> str:
-    """
-    Tạo ID duy nhất (MD5 Hash) cho point dựa trên ID văn bản và vị trí điều khoản.
-    Output ví dụ: 'a1b2c3d4e5f6...' (32 ký tự, an toàn cho URL/Frontend key)
-    """
-    # Xử lý trường hợp null
-    safe_doc_id = str(doc_id) if doc_id else "unknown_doc"
-    safe_path = str(hierarchy_path) if hierarchy_path else "general"
-
-    # Tạo chuỗi kết hợp (Raw String)
-    raw_combination = f"{safe_doc_id}_{safe_path}"
-
-    # Hash MD5 để tạo chuỗi ID cố định, không trùng lặp và an toàn
-    return hashlib.md5(raw_combination.encode('utf-8')).hexdigest()
 
 batch_size = 128
 model_name = os.getenv("EMBEDDING_MODEL")

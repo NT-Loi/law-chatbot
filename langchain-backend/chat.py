@@ -17,10 +17,10 @@ from prompts import (
     SELECT_SYSTEM_PROMPT, SELECT_USER_PROMPT,
     ANSWER_SYSTEM_PROMPT, ANSWER_USER_PROMPT,
     CHIT_CHAT_SYSTEM_PROMPT,
-    EXPANSION_SYSTEM_PROMPT, EXPANSION_USER_PROMPT,
     HYBRID_SYSTEM_PROMPT, HYBRID_USER_PROMPT,
     WEB_SEARCH_SYSTEM_PROMPT, WEB_SEARCH_USER_PROMPT,
     REFLECTION_SYSTEM_PROMPT, REFLECTION_USER_PROMPT,
+    ALQAC_ANSWER_SYSTEM_PROMPT
 )
 
 load_dotenv()
@@ -83,16 +83,6 @@ def parse_selected_ids(llm_output: str) -> List[str]:
     except Exception:
         logging.error(f"Failed to parse IDs from: {llm_output}")
         return []
-
-def clean_reasoning_output(text: str) -> str:
-    """
-    Loại bỏ nội dung nằm giữa thẻ <think> và </think> (nếu có)
-    để lấy kết quả cuối cùng.
-    """
-    # Pattern tìm thẻ <think>...</think>, cờ re.DOTALL để match cả xuống dòng
-    pattern = r"<think>.*?</think>"
-    cleaned_text = re.sub(pattern, "", text, flags=re.DOTALL)
-    return cleaned_text.strip()
 
 # --- Data Models ---
 class ChatMode(str, Enum):
@@ -213,7 +203,7 @@ class WebSearchEngine:
             return []
 
 # --- Helper Logic for Streaming with Citations ---
-async def stream_with_citations(llm, messages, rag_engine=None):
+async def stream_with_citations(llm, messages, rag_engine=None, collection_names=None):
     """
     Handles streaming response from LLM, parsing <USED_DOCS> tags 
     to separate content from citations.
@@ -285,11 +275,10 @@ async def stream_with_citations(llm, messages, rag_engine=None):
              yield json.dumps({"type": "content", "delta": buffer}, ensure_ascii=False) + "\n"
 
     # Send used_docs event
-    # Send used_docs event
     if used_ids:
         if rag_engine:
              # Load full details from Qdrant
-             rich_docs = await asyncio.to_thread(rag_engine.get_documents_by_ids, used_ids)
+             rich_docs = await asyncio.to_thread(rag_engine.get_documents_by_ids, used_ids, collection_names=collection_names)
              yield json.dumps({"type": "used_docs", "data": rich_docs}, ensure_ascii=False) + "\n"
         else:
              yield json.dumps({"type": "used_docs", "ids": used_ids}, ensure_ascii=False) + "\n"
@@ -321,7 +310,7 @@ class LegalRAGChain:
             temperature=0.0, max_tokens=1024 # Tăng token một chút cho suy luận
         )
 
-    async def chat(self, message, history, rag_engine):
+    async def chat(self, message, history, rag_engine, collection_names: List[str] = None, system_prompt: str = None):
         # --- BƯỚC PRE-PROCESSING: LÀM SẠCH HISTORY ---
         clean_history = []
         for h in history:
@@ -382,7 +371,7 @@ class LegalRAGChain:
         
         # Mỗi query lấy top 20 thô (chưa rerank)
         tasks = [
-            asyncio.to_thread(rag_engine.retrieve, q, top_k=20) 
+            asyncio.to_thread(rag_engine.retrieve, q, top_k=20, collection_names=collection_names) 
             for q in queries
         ]
         
@@ -471,15 +460,18 @@ class LegalRAGChain:
             yield json.dumps({"type": "content", "delta": "Không tìm thấy quy định phù hợp."}, ensure_ascii=False) + "\n"
             return
 
-         # --- BƯỚC 4: ANSWERING ---
+        # --- BƯỚC 4: ANSWERING ---
         final_context = format_law_docs_for_prompt(filtered_docs)
+        
+        # Decide which system prompt to use
+        current_system_prompt = system_prompt if system_prompt else ANSWER_SYSTEM_PROMPT
         
         # Dùng câu hỏi gốc (message) để trả lời cho tự nhiên
         answer_messages = [
-            SystemMessage(content=ANSWER_SYSTEM_PROMPT.format(context=final_context))
+            SystemMessage(content=current_system_prompt.format(context=final_context))
         ] + chat_history_msgs + [HumanMessage(content=ANSWER_USER_PROMPT.format(question=message))]
 
-        async for chunk in stream_with_citations(self.answer_llm, answer_messages, rag_engine=rag_engine):
+        async for chunk in stream_with_citations(self.answer_llm, answer_messages, rag_engine=rag_engine, collection_names=collection_names):
             yield chunk
 
 
@@ -492,35 +484,41 @@ class WebLawChain:
         )
 
     async def chat(self, message, history, rag_engine):
-        # --- BƯỚC PRE-PROCESSING: LÀM SẠCH HISTORY ---
+        # Clean history
         clean_history = []
         for h in history:
-            # Copy dict để không ảnh hưởng biến gốc
             msg = h.copy()
-            # Chỉ làm sạch tin nhắn của AI (role assistant)
             if msg['role'] == 'assistant':
                 msg['content'] = clean_reasoning_output(msg['content'])
             clean_history.append(msg)
-        
-        # Cập nhật biến history dùng cho các bước sau
         history = clean_history
-        yield json.dumps({"type": "status", "message": "Đang tìm kiếm thông tin trên internet..."}, ensure_ascii=False) + "\n"
-        # Chạy search trong thread pool để không block server
-        web_results = await asyncio.to_thread(self.web_engine.search, message, top_k=50)
         
-        yield json.dumps({"type": "sources", "data": web_results}, ensure_ascii=False) + "\n"
+        yield json.dumps({"type": "status", "message": "Đang tìm kiếm thông tin trên internet..."}, ensure_ascii=False) + "\n"
+        
+        # Run search in thread pool
+        web_results = await asyncio.to_thread(self.web_engine.search, message, top_k=10)
         
         if not web_results:
             yield json.dumps({"type": "content", "delta": "Không tìm thấy thông tin trên internet."}, ensure_ascii=False) + "\n"
             return
         
-        # 2. Return Sources
+        # Return sources (only once)
         yield json.dumps({"type": "sources", "data": web_results}, ensure_ascii=False) + "\n"
-        logging.info('Web Results: ', web_results)
-        # 3. Answer
+        logging.info(f'Web Results: {len(web_results)} items')
+        
+        # Build chat history messages
+        chat_history_msgs = []
+        for h in history[-4:]:
+            if h['role'] == 'user':
+                chat_history_msgs.append(HumanMessage(content=h['content'][:500]))
+            else:
+                chat_history_msgs.append(AIMessage(content=h['content'][:500]))
+        
+        # Answer with history context
         messages = [
-            SystemMessage(content=WEB_SEARCH_SYSTEM_PROMPT.format(web_results=json.dumps(web_results, ensure_ascii=False, indent=2))),
-            HumanMessage(content=WEB_SEARCH_USER_PROMPT.format(question=message))
+            SystemMessage(content=WEB_SEARCH_SYSTEM_PROMPT.format(web_results=json.dumps(web_results, ensure_ascii=False, indent=2)))
+        ] + chat_history_msgs + [
+            HumanMessage(content=message)
         ]
         
         async for chunk in stream_with_citations(self.llm, messages):
@@ -536,61 +534,72 @@ class HybridChain:
         )
 
     async def chat(self, message, history, rag_engine):
-        # --- BƯỚC PRE-PROCESSING: LÀM SẠCH HISTORY ---
+        # Clean history
         clean_history = []
         for h in history:
-            # Copy dict để không ảnh hưởng biến gốc
             msg = h.copy()
-            # Chỉ làm sạch tin nhắn của AI (role assistant)
             if msg['role'] == 'assistant':
                 msg['content'] = clean_reasoning_output(msg['content'])
             clean_history.append(msg)
-        
-        # Cập nhật biến history dùng cho các bước sau
         history = clean_history
+        
         yield json.dumps({"type": "status", "message": "Đang đối chiếu dữ liệu hệ thống và internet..."}, ensure_ascii=False) + "\n"
-        # --- BƯỚC 1: RETRIEVE PARALLEL ---
         
-        # Chạy song song: RAG (local/db) và Tavily (network)
-        # Vì rag_engine.retrieve hiện tại là sync code (nếu chưa sửa thành async), 
-        # ta cũng wrap nó vào to_thread cho chắc chắn
-        
-        rag_task = asyncio.to_thread(rag_engine.retrieve, message, top_k=50)
-        web_task = asyncio.to_thread(self.web_engine.search, message, top_k=50)
-
+        # Parallel retrieval: RAG + Web
+        rag_task = asyncio.to_thread(rag_engine.retrieve, message, top_k=20)
+        web_task = asyncio.to_thread(self.web_engine.search, message, top_k=10)
         rag_docs, web_docs = await asyncio.gather(rag_task, web_task)
 
-        # Gán nhãn source_type
+        # Label source types
         for d in rag_docs: d["source_type"] = "LAW_DB"
         for d in web_docs: d["source_type"] = "WEB"
 
+        # Prioritize LAW_DB by putting them first, then rerank all
         all_docs = rag_docs + web_docs
+        
+        if all_docs:
+            # Rerank merged results to get most relevant
+            ranked_docs = await asyncio.to_thread(rag_engine.rerank, message, all_docs, top_k=15)
+            # Sort to prioritize LAW_DB within reranked results
+            ranked_docs.sort(key=lambda x: (0 if x.get("source_type") == "LAW_DB" else 1, -x.get("rerank_score", 0)))
+        else:
+            ranked_docs = []
 
-        # --- BƯỚC 2: STREAM SOURCES ---
-        yield json.dumps({"type": "sources", "data": all_docs}, ensure_ascii=False) + "\n"
+        # Stream sources
+        yield json.dumps({"type": "sources", "data": ranked_docs}, ensure_ascii=False) + "\n"
 
-        if not all_docs:
+        if not ranked_docs:
              yield json.dumps({"type": "content", "delta": "Không tìm thấy thông tin ở cả kho luật và internet."}, ensure_ascii=False) + "\n"
              return
 
-        # --- BƯỚC 3: FORMAT CONTEXT PHÂN BIỆT NGUỒN ---
+        # Format context with IDs for citation
         context_blocks = []
-        for d in all_docs:
+        for d in ranked_docs:
             source_label = "[KHO_LUAT]" if d.get("source_type") == "LAW_DB" else "[INTERNET]"
+            doc_id = d.get('id', d.get('url', 'unknown'))
             context_blocks.append(f"""
-            {source_label}
-            Tiêu đề: {d.get('title', '')}
-            Nội dung: {d['content']}
-            """)
-        full_context = "\n".join(context_blocks)
+{source_label}
+[ID: {doc_id}]
+Tiêu đề: {d.get('title', '')}
+Nội dung: {d.get('content', '')}
+""")
+        full_context = "\n---\n".join(context_blocks)
 
-        # --- BƯỚC 4: ANSWERING WITH CITATIONS ---
+        # Build chat history messages
+        chat_history_msgs = []
+        for h in history[-4:]:
+            if h['role'] == 'user':
+                chat_history_msgs.append(HumanMessage(content=h['content'][:500]))
+            else:
+                chat_history_msgs.append(AIMessage(content=h['content'][:500]))
+
+        # Answering with history context
         messages = [
-            SystemMessage(content=HYBRID_SYSTEM_PROMPT.format(context=full_context)),
-            HumanMessage(content=HYBRID_USER_PROMPT.format(question=message))
+            SystemMessage(content=HYBRID_SYSTEM_PROMPT.format(context=full_context))
+        ] + chat_history_msgs + [
+            HumanMessage(content=message)
         ]
 
-        # Use shared streaming logic
         async for chunk in stream_with_citations(self.llm, messages, rag_engine=rag_engine):
             yield chunk
 
